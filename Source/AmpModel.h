@@ -15,9 +15,9 @@ namespace amp
 {
 constexpr double pi = 3.14159265358979323846;
 
-// Supply rails. The schematic does not print voltages. ESTIMATE, from the
-// 485-500 V B+ reported by technicians and the rail dropping resistors.
-constexpr double railV1 = 330.0, railV2 = 370.0, railV3 = 470.0, railPlate = 490.0, railScreen = 470.0;
+// Preamp rails are solved from a measured 468 V supply through the 4k, 22k and 10k dropping resistors.
+// Plate voltage was measured on a real amp.
+constexpr double railV1 = 328.0, railV2 = 344.0, railV3 = 439.0, railPlate = 478.0, railScreen = 470.0;
 
 struct Triode
 {
@@ -253,7 +253,7 @@ private:
         const double gg = 1.0 / rg, gp = 1.0 / c.rp, gkt = 1.0 / c.rk + gk;
         double lastNorm = 0.0, lastDg = 0.0, lastDp = 0.0, lastDk = 0.0;
 
-        for (int iter = 0; iter < 24; ++iter)
+        for (int iter = 0; iter < 200; ++iter) // rarely used, but a hard sample must always converge
         {
             const auto cur = triodeCurrent (ax7, vg - vk, vp - vk);
             double ig, dIg;
@@ -510,6 +510,84 @@ private:
     std::array<std::array<double, N>, N> inv {};
 };
 
+// Negative feedback path from the output transformer to the phase inverter's tail:
+//   feedback - R56 - A - (C12 || Resonance) - B - C30 - Q - R57 - ground
+//   B - (C8 + C62) - Presence - ground
+class FeedbackNetwork
+{
+public:
+    static constexpr int N = 4;
+    enum Node { A, B, Pt, Q };
+
+    static constexpr double R56 = 39e3, R57 = 4.7e3, C12 = 0.0068e-6, CPresence = 0.1e-6 + 0.033e-6, C30 = 22e-6;
+    static constexpr double RResonanceMax = 1e6, RPresenceMax = 10e3;
+
+    // Both pots are audio taper. Presence is at minimum resistance fully clockwise,
+    // which removes the most feedback and gives the brightest sound.
+    static double resonanceOhms (double knob) { return std::max (RResonanceMax * std::pow (knob, 2.5), 100.0); }
+    static double presenceOhms (double knob) { return std::max (RPresenceMax * (1.0 - std::pow (knob, 2.5)), 10.0); }
+
+    void prepare (double sampleRate) { fs = sampleRate; reset(); setControls (0.5, 0.5); }
+    void reset() { hist = {}; }
+
+    void setControls (double resonance, double presence)
+    {
+        std::array<std::array<double, N>, N> g {};
+        const auto add = [&] (int p, int q, double y)
+        {
+            if (p >= 0) g[(size_t) p][(size_t) p] += y;
+            if (q >= 0) g[(size_t) q][(size_t) q] += y;
+            if (p >= 0 && q >= 0) { g[(size_t) p][(size_t) q] -= y; g[(size_t) q][(size_t) p] -= y; }
+        };
+
+        add (A, -1, 1.0 / R56);
+        add (A, B, 1.0 / resonanceOhms (resonance));
+        add (Pt, -1, 1.0 / presenceOhms (presence));
+        add (Q, -1, 1.0 / R57);
+
+        const double k = 2.0 * fs;
+        for (size_t i = 0; i < caps.size(); ++i)
+        {
+            capG[i] = k * capValues[i];
+            add (caps[i].first, caps[i].second, capG[i]);
+        }
+        invertMatrix<N> (g, inv);
+    }
+
+    // Returns the voltage reaching the tail node Q.
+    double process (double vsrc)
+    {
+        std::array<double, N> rhs {};
+        rhs[A] = vsrc / R56;
+        for (size_t i = 0; i < caps.size(); ++i)
+        {
+            if (caps[i].first >= 0) rhs[(size_t) caps[i].first] += hist[i];
+            if (caps[i].second >= 0) rhs[(size_t) caps[i].second] -= hist[i];
+        }
+
+        std::array<double, N> v {};
+        for (size_t r = 0; r < N; ++r)
+            for (size_t c = 0; c < N; ++c)
+                v[r] += inv[r][c] * rhs[c];
+
+        for (size_t i = 0; i < caps.size(); ++i)
+        {
+            const double p = caps[i].first >= 0 ? v[(size_t) caps[i].first] : 0.0;
+            const double q = caps[i].second >= 0 ? v[(size_t) caps[i].second] : 0.0;
+            hist[i] = 2.0 * capG[i] * (p - q) - hist[i];
+        }
+        return v[Q];
+    }
+
+private:
+    static constexpr std::array<std::pair<int, int>, 3> caps { { { A, B }, { B, Pt }, { B, Q } } };
+    static constexpr std::array<double, 3> capValues { C12, CPresence, C30 };
+
+    double fs = 176400.0;
+    std::array<double, 3> capG {}, hist {};
+    std::array<std::array<double, N>, N> inv {};
+};
+
 // Long-tail-pair inverter with loop feedback injected into the tail.
 class PhaseInverter
 {
@@ -542,8 +620,9 @@ public:
 private:
     void solve (double input, double fb, bool dc)
     {
-        const double rq = R57 * R56 / (R57 + R56);
-        const double fbk = R57 / (R57 + R56);
+        // Feedback arrives already scaled by FeedbackNetwork; C30 keeps it out of the DC path.
+        const double rq = R57;
+        const double fbk = 1.0;
         const double rt = R52 + R51 + rq;
 
         for (int iter = 0; iter < (dc ? 60 : 10); ++iter)
@@ -595,7 +674,8 @@ private:
 
 struct Pentode
 {
-    static constexpr double mu = 8.7, ex = 1.35, kg1 = 1460.0, kp = 48.0, kvb = 12.0;
+    // kg1 is lowered from the published 1460 so the output stage reaches the 120 W measured on a real amp.
+    static constexpr double mu = 8.7, ex = 1.35, kg1 = 1100.0, kp = 48.0, kvb = 12.0;
 
     static void plate (double vg, double vp, double& ip, double& dVp)
     {
@@ -612,21 +692,14 @@ struct Pentode
 class PowerStage
 {
 public:
-    static constexpr double Zaa = 1900.0;          // ESTIMATE: typical for 4 x 6L6 at 120 W
-    static constexpr double idle = 0.018;          // ESTIMATE: per tube; technicians report 11-20 mA
+    static constexpr double Zaa = 2900.0;          // Fitted to the 31 V rms into 8 ohm measured at full power
+    static constexpr double biasVolts = -58.0;     // Measured on a real amp
     static constexpr double Rleak = 220e3, Rstop = 2200.0, Cc = 0.047e-6;
 
     void prepare (double fs)
     {
         g = 2.0 * Cc * fs;
-        double lo = -120.0, hi = 0.0;
-        for (int i = 0; i < 60; ++i)
-        {
-            bias = 0.5 * (lo + hi);
-            double ip, d;
-            Pentode::plate (bias, railPlate, ip, d);
-            (ip > idle ? hi : lo) = bias;
-        }
+        bias = biasVolts;
         x = 0.0;
     }
 
@@ -730,6 +803,7 @@ public:
 
         tone.prepare (fs);
         rhythm.prepare (fs);
+        feedback.prepare (fs);
         pi2.prepare (fs);
         pi2.dcTrack = 2.0 * pi * 3.4 / fs;
         power.prepare (fs);
@@ -774,12 +848,7 @@ public:
         postLead = std::pow (controls.post, 2.5);
         postRhythm = std::pow (controls.rhythmPost, 2.5);
 
-        // Feedback shelf: Resonance is R || .0068u in series with the 39k return,
-        // Presence is a pot and .1u shunting high frequencies at the tail.
-        const double rr = std::max (1.0e6 * controls.resonance, 1.0), c12 = 0.0068e-6, r56 = PhaseInverter::R56;
-        resonanceNet.setAnalog (0.0, r56 * rr * c12, r56, 0.0, r56 * rr * c12, r56 + rr, fs);
-        const double rp = std::max (10e3 * (1.0 - controls.presence), 100.0);
-        presenceNet.setAnalog (0.0, rp * 0.1e-6, 1.0, 0.0, (rp + 4.2e3) * 0.1e-6, 1.0, fs);
+        feedback.setControls (controls.resonance, controls.presence);
     }
 
     double process (double vin)
@@ -816,7 +885,7 @@ public:
         const double driven = v3a.process (t * (activeLead ? postLead : postRhythm) * channelGain * 0.98, 0.0);
         const double dcPi = blockPi.lowPass (driven);
 
-        const double fb = presenceNet.process (resonanceNet.process (lastPrimary / feedbackTurns));
+        const double fb = feedback.process (lastPrimary / feedbackTurns);
         pi2.process ((driven - dcPi) * 0.91, fb);
 
         const double raw = power.process (pi2.plateA(), pi2.plateB());
@@ -853,7 +922,7 @@ private:
             process (0.0);
     }
 
-    static constexpr double feedbackTurns = 10.9; // sqrt (Zaa / 16)
+    static constexpr double feedbackTurns = 13.46; // sqrt (Zaa / 16)
     static constexpr double outputScale = 1.0 / 1400.0; // maps the speaker signal into digital range
 
     double fs = 192000.0, v1aDc = 0.0, postLead = 0.1, postRhythm = 0.1, lastPrimary = 0.0;
@@ -866,6 +935,7 @@ private:
     ToneNetwork tone;
     PhaseInverter pi2;
     PowerStage power;
-    Biquad preNet, resonanceNet, presenceNet, speakerLow, speakerHigh, cabHp, cabLow, cabMid, cabLp1, cabLp2;
+    FeedbackNetwork feedback;
+    Biquad preNet, speakerLow, speakerHigh, cabHp, cabLow, cabMid, cabLp1, cabLp2;
 };
 } // namespace amp

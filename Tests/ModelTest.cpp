@@ -105,6 +105,32 @@ static double rhythmDb (double f, double pre, bool crunch)
     return 20.0 * std::log10 (std::abs (h));
 }
 
+// Feedback network reduced by hand to series and parallel impedances.
+static double feedbackDb (double f, double resonance, double presence)
+{
+    using F = FeedbackNetwork;
+    const cd s (0.0, 2.0 * pi * f);
+    const auto par = [] (cd a, cd b) { return a * b / (a + b); };
+    const cd series = F::R56 + par (F::resonanceOhms (resonance), 1.0 / (s * F::C12));
+    const cd toQ = 1.0 / (s * F::C30) + F::R57;
+    const cd atB = par (1.0 / (s * F::CPresence) + F::presenceOhms (presence), toQ);
+    return 20.0 * std::log10 (std::abs (atB / (series + atB) * F::R57 / toQ));
+}
+
+static double measureFeedbackDb (FeedbackNetwork& t, double f, double fs)
+{
+    t.reset();
+    const int settle = (int) (fs * 1.0), n = (int) (std::ceil (f * 0.2) / f * fs);
+    double in2 = 0.0, out2 = 0.0;
+    for (int i = 0; i < settle + n; ++i)
+    {
+        const double x = std::sin (2.0 * pi * f * i / fs);
+        const double y = t.process (x);
+        if (i >= settle) { in2 += x * x; out2 += y * y; }
+    }
+    return 10.0 * std::log10 (out2 / in2);
+}
+
 static double measureRhythmDb (RhythmNetwork& t, double f, double fs)
 {
     t.reset();
@@ -218,6 +244,28 @@ int main()
                     check (label, measureRhythmDb (t, f, fs) - rhythmDb (f, pre, crunch), -0.25, 0.25);
                 }
             }
+    }
+
+    std::puts ("-- feedback network vs hand-reduced impedances (dB error) --");
+    {
+        FeedbackNetwork t;
+        t.prepare (fs);
+        for (double res : { 0.0, 0.5, 1.0 })
+            for (double pres : { 0.0, 0.5, 1.0 })
+            {
+                t.setControls (res, pres);
+                for (double f : { 60.0, 400.0, 4000.0 })
+                {
+                    char label[64];
+                    std::snprintf (label, sizeof label, "res %.1f pres %.1f %5.0f Hz", res, pres, f);
+                    check (label, measureFeedbackDb (t, f, fs) - feedbackDb (f, res, pres), -0.25, 0.25);
+                }
+            }
+
+        // More feedback removed means more gain from the amp at that frequency.
+        check ("Presence up removes high feedback (dB drop at 4 kHz)", feedbackDb (4000.0, 0.5, 0.0) - feedbackDb (4000.0, 0.5, 1.0), 6.0, 60.0);
+        check ("Resonance up removes low feedback (dB drop at 80 Hz)", feedbackDb (80.0, 0.0, 0.5) - feedbackDb (80.0, 1.0, 0.5), 3.0, 60.0);
+        check ("Resonance barely touches highs (dB change at 6 kHz)", std::abs (feedbackDb (6000.0, 0.0, 0.5) - feedbackDb (6000.0, 1.0, 0.5)), 0.0, 3.0);
     }
 
     std::puts ("-- channels --");
@@ -344,7 +392,7 @@ int main()
         const int period = (int) std::round (fs / 87.5);
         const double f = fs / period;
         double worst = -200.0;
-        for (double level : { 0.2, 0.3, 0.45, 0.7, 1.0 })
+        for (double level : { 0.175, 0.2, 0.3, 0.4, 0.45, 0.7, 0.75, 1.0, 1.25 })
         {
             Amp q;
             q.prepare (fs);
@@ -377,6 +425,52 @@ int main()
             worst = std::max (worst, 10.0 * std::log10 ((d + 1e-30) / (e + 1e-30)));
         }
         check ("worst non-repeating part of a steady note (dB)", worst, -200.0, -70.0);
+    }
+    std::puts ("-- power stage against measurements of a real amp --");
+    {
+        const double f = fs / 176.0, z = PowerStage::Zaa;
+        double power = 0.0;
+        for (double drive = 20.0; drive <= 200.0; drive += 5.0)
+        {
+            PowerStage s;
+            s.prepare (fs);
+            s.setSourceDc (0.0, 0.0);
+            const int settle = (int) fs / 8, n = 176 * 60;
+            double sum2 = 0.0, a = 0.0, b = 0.0;
+            for (int i = 0; i < settle + n; ++i)
+            {
+                const double t = 2.0 * pi * f * i / fs, v = drive * std::sin (t);
+                const double y = s.process (v, -v);
+                if (i >= settle) { sum2 += y * y; a += y * std::sin (t); b += y * std::cos (t); }
+            }
+            const double rms = std::sqrt (sum2 / n), fund = std::sqrt (2.0) * std::hypot (a, b) / n;
+            const double thd = std::sqrt (std::max (0.0, rms * rms - fund * fund)) / fund;
+            if (thd <= 0.10)
+                power = std::max (power, rms * rms / z);
+        }
+        check ("power at up to 10% distortion (W, measured 120)", power, 110.0, 130.0);
+        check ("voltage into 8 ohm (V rms, measured 31)", std::sqrt (power * 8.0), 29.5, 32.5);
+
+        PowerStage s;
+        s.prepare (fs);
+        check ("bias voltage (measured -58)", s.biasVoltage(), -58.5, -57.5);
+        double ip, slope;
+        Pentode::plate (s.biasVoltage(), railPlate, ip, slope);
+        check ("idle current per tube (mA, stock amps 11-14)", ip * 1000.0, 10.0, 15.0);
+    }
+
+    std::puts ("-- preamp rails against the supply chain --");
+    {
+        Amp q;
+        q.prepare (fs);
+        const auto v = [&] (int s) { return q.stage (s).plate(); };
+        const double i1 = (railV1 - v (0)) / 220e3 + (railV1 - v (1)) / 100e3 + (railV1 - v (2)) / 100e3;
+        const double i2 = (railV2 - v (3)) / 220e3 + (railV2 - v (4)) / 220e3 + (railV2 - v (5)) / 100e3 + (railV2 - v (6)) / 68e3;
+        const double i3 = q.inverter().tailCurrent();
+        const double n3 = 468.0 - 4e3 * (i1 + i2 + i3), n2 = n3 - 22e3 * (i1 + i2), n1 = n2 - 10e3 * i1;
+        check ("V3 rail minus supply-chain value (V)", railV3 - n3, -3.0, 3.0);
+        check ("V2 rail minus supply-chain value (V)", railV2 - n2, -3.0, 3.0);
+        check ("V1 rail minus supply-chain value (V)", railV1 - n1, -3.0, 3.0);
     }
     std::puts ("-- stability --");
     for (double rate : { 88200.0, 176400.0, 384000.0 })
