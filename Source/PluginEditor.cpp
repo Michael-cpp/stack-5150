@@ -243,6 +243,116 @@ void CreamButton::paintButton (juce::Graphics& g, bool, bool down)
     g.drawHorizontalLine ((int) b.getY() + 1, b.getX() + 2.0f, b.getRight() - 2.0f);
 }
 
+TunerPanel::TunerPanel (Stack5150Processor& p)
+    : processor (p),
+      muteAttachment (p.params, "tunermute", mute),
+      a4Attachment (p.params, "a4", a4)
+{
+    addAndMakeVisible (mute);
+    a4.setSliderStyle (juce::Slider::LinearHorizontal);
+    a4.setTextBoxStyle (juce::Slider::TextBoxRight, false, 52, 22);
+    a4.setTextValueSuffix (" Hz");
+    addAndMakeVisible (a4);
+    setWantsKeyboardFocus (true);
+}
+
+void TunerPanel::visibilityChanged()
+{
+    if (isVisible())
+    {
+        startTimerHz (30);
+        if (isShowing())
+            grabKeyboardFocus();
+    }
+    else
+    {
+        stopTimer();
+    }
+}
+
+bool TunerPanel::keyPressed (const juce::KeyPress&)
+{
+    if (onClose != nullptr)
+        onClose();
+    return true;
+}
+
+void TunerPanel::timerCallback()
+{
+    // Clicks outside the plugin window never reach its components, so they are polled here.
+    if (juce::ModifierKeys::getCurrentModifiersRealtime().isAnyMouseButtonDown()
+        && ! getTopLevelComponent()->getScreenBounds().contains (juce::Desktop::getMousePosition()))
+    {
+        if (onClose != nullptr)
+            onClose();
+        return;
+    }
+
+    analyseThisTick = ! analyseThisTick;
+    if (! analyseThisTick)
+        return;
+
+    reading = processor.getTuner().analyse ((double) processor.params.getRawParameterValue ("a4")->load());
+    repaint();
+}
+
+void TunerPanel::resized()
+{
+    auto row = getLocalBounds().reduced (14, 10).removeFromBottom (26);
+    mute.setBounds (row.removeFromLeft (112));
+    a4.setBounds (row.withTrimmedLeft (34));
+}
+
+void TunerPanel::paint (juce::Graphics& g)
+{
+    auto area = getLocalBounds().toFloat();
+    g.setColour (juce::Colour (0xf20b0c0d));
+    g.fillRoundedRectangle (area, 5.0f);
+    g.setColour (juce::Colour (0xff46484c));
+    g.drawRoundedRectangle (area.reduced (0.5f), 5.0f, 1.0f);
+
+    const bool inTune = reading.valid && std::abs (reading.cents) <= 3.0;
+    const auto green = juce::Colour (0xff3cff58), amber = juce::Colour (0xffffb02a), dim = juce::Colour (0xff77797d);
+
+    const int width = getWidth();
+    g.setColour (reading.valid ? (inTune ? green : amber) : dim);
+    g.setFont (faceFont (64.0f));
+    g.drawText (reading.valid ? juce::String (tools::noteName (reading.midi)) : juce::String ("--"), 0, 12, width, 70, juce::Justification::centred);
+
+    g.setColour (juce::Colour (0xffb9b5a8));
+    g.setFont (faceFont (13.0f, false));
+    const auto detail = reading.valid
+        ? "Octave " + juce::String (tools::noteOctave (reading.midi)) + "   " + juce::String (reading.hz, 1) + " Hz   "
+              + (reading.cents >= 0.0 ? "+" : "") + juce::String (reading.cents, 1) + " cents"
+        : juce::String ("Play a single note");
+    g.drawText (detail, 0, 84, width, 20, juce::Justification::centred);
+
+    // Cents scale, -50 to +50.
+    const float left = 28.0f, right = (float) width - 28.0f, y = 128.0f, middle = 0.5f * (left + right);
+    for (int c = -50; c <= 50; c += 10)
+    {
+        const float x = left + (right - left) * (float) (c + 50) / 100.0f;
+        const float half = c == 0 ? 11.0f : (c % 50 == 0 ? 8.0f : 5.0f);
+        g.setColour (c == 0 ? green.withAlpha (0.8f) : dim);
+        g.drawLine (x, y - half, x, y + half, c == 0 ? 2.0f : 1.0f);
+    }
+    g.setColour (dim);
+    g.setFont (faceFont (10.0f, false));
+    g.drawText ("-50", (int) left - 15, (int) y + 12, 30, 12, juce::Justification::centred);
+    g.drawText ("+50", (int) right - 15, (int) y + 12, 30, 12, juce::Justification::centred);
+
+    if (reading.valid)
+    {
+        const float x = middle + (right - left) * (float) reading.cents / 100.0f;
+        g.setColour (inTune ? green : amber);
+        g.fillRoundedRectangle (x - 3.0f, y - 15.0f, 6.0f, 30.0f, 2.0f);
+    }
+
+    g.setColour (juce::Colour (0xffb9b5a8));
+    g.setFont (faceFont (11.0f));
+    g.drawText ("A4", 126, getHeight() - 36, 30, 26, juce::Justification::centred);
+}
+
 void Stack5150Editor::addKnob (Knob& knob, const char* paramId)
 {
     auto& s = knob.slider;
@@ -302,6 +412,21 @@ Stack5150Editor::Stack5150Editor (Stack5150Processor& p) : AudioProcessorEditor 
     impulseLabel.setMinimumHorizontalScale (0.7f);
     addAndMakeVisible (impulseLabel);
 
+    tunerButton.setClickingTogglesState (true);
+    tunerButton.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff2a2b2e));
+    tunerButton.setColour (juce::TextButton::buttonOnColourId, juce::Colour (0xff2f8a45));
+    addAndMakeVisible (tunerButton);
+    tunerAttachment = std::make_unique<ButtonAttachment> (p.params, "tuner", tunerButton);
+    const auto closeTuner = [this]
+    {
+        processor.params.getParameter ("tuner")->setValueNotifyingHost (0.0f);
+        timerCallback();
+    };
+    tunerBackdrop.onClick = closeTuner;
+    tunerPanel.onClose = closeTuner;
+    addChildComponent (tunerBackdrop);
+    addChildComponent (tunerPanel);
+
     setSize (1200, 470);
     startTimerHz (10);
     timerCallback();
@@ -316,6 +441,10 @@ Stack5150Editor::~Stack5150Editor()
 
 void Stack5150Editor::timerCallback()
 {
+    const bool tunerOpen = processor.params.getRawParameterValue ("tuner")->load() > 0.5f;
+    tunerBackdrop.setVisible (tunerOpen);
+    tunerPanel.setVisible (tunerOpen);
+
     const bool lead = processor.params.getRawParameterValue ("channel")->load() > 0.5f;
     const bool power = processor.params.getRawParameterValue ("power")->load() > 0.5f;
     const bool standby = processor.params.getRawParameterValue ("standby")->load() > 0.5f;
@@ -563,7 +692,10 @@ void Stack5150Editor::resized()
     const int rowY = 425, plateH = 28;
     presetBox.setBounds (78, rowY, 164, plateH); savePreset.setBounds (250, rowY, 54, plateH); deletePreset.setBounds (310, rowY, 60, plateH); cabMode.setBounds (446, rowY, 104, plateH);
     loadButton.setBounds (558, rowY, 80, plateH);
-    impulseLabel.setBounds (646, rowY, 382, plateH);
+    impulseLabel.setBounds (646, rowY, 306, plateH);
+    tunerButton.setBounds (960, rowY, 68, plateH);
+    tunerBackdrop.setBounds (getLocalBounds());
+    tunerPanel.setBounds (440, 40, 320, 206);
     calibration.slider.setBounds (1110, 419, 40, 40);
 
     auto& layout = faceLayout;

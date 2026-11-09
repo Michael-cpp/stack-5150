@@ -30,6 +30,41 @@ public:
     void paintButton (juce::Graphics&, bool highlighted, bool down) override;
 };
 
+// Invisible layer over the amp while the tuner is open, so an outside click only closes it.
+class ClickCatcher : public juce::Component
+{
+public:
+    void mouseDown (const juce::MouseEvent&) override { if (onClick != nullptr) onClick(); }
+    std::function<void()> onClick;
+};
+
+class TunerPanel : public juce::Component,
+                   private juce::Timer
+{
+public:
+    explicit TunerPanel (Stack5150Processor&);
+
+    void paint (juce::Graphics&) override;
+    void resized() override;
+    void visibilityChanged() override;
+    bool keyPressed (const juce::KeyPress&) override;
+
+    std::function<void()> onClose;
+
+private:
+    void timerCallback() override;
+
+    Stack5150Processor& processor;
+    tools::TunerReading reading;
+    bool analyseThisTick = false;
+    juce::ToggleButton mute { "Mute output" };
+    juce::Slider a4;
+    juce::AudioProcessorValueTreeState::ButtonAttachment muteAttachment;
+    juce::AudioProcessorValueTreeState::SliderAttachment a4Attachment;
+
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (TunerPanel)
+};
+
 class Stack5150Editor : public juce::AudioProcessorEditor,
                         public juce::FileDragAndDropTarget,
                         private juce::Timer
@@ -86,6 +121,10 @@ private:
     std::unique_ptr<juce::AlertWindow> dialog;
     juce::TextButton loadButton { "LOAD IR" };
     juce::Label impulseLabel;
+    juce::TextButton tunerButton { "TUNER" };
+    std::unique_ptr<ButtonAttachment> tunerAttachment;
+    ClickCatcher tunerBackdrop;
+    TunerPanel tunerPanel { processor };
     std::unique_ptr<juce::FileChooser> chooser;
     juce::Image faceImage, faceImageDark;
     face::Layout faceLayout;

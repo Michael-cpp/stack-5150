@@ -7,6 +7,7 @@
 
 #include "AmpModel.h"
 #include "IrLoad.h"
+#include "Tuner.h"
 
 class Stack5150Processor : public juce::AudioProcessor
 {
@@ -46,6 +47,8 @@ public:
     static juce::File getPresetFolder();
     static juce::File presetFileForName (const juce::File& folder, const juce::String& name);
 
+    tools::Tuner& getTuner() { return tuner; }
+
     juce::AudioProcessorValueTreeState params;
 
 private:
@@ -53,7 +56,9 @@ private:
 
     amp::Controls readControls() const;
     void restoreState (const juce::XmlElement&);
+    bool isOutputOpen() const;
 
+    tools::Tuner tuner;
     amp::Amp model;
     std::unique_ptr<juce::dsp::Oversampling<float>> oversampling;
     juce::AudioBuffer<float> mono;

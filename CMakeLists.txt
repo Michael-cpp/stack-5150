@@ -46,6 +46,9 @@ target_link_libraries(Stack5150
 add_executable(ModelTest Tests/ModelTest.cpp)
 target_include_directories(ModelTest PRIVATE Source)
 
+add_executable(TunerTest Tests/TunerTest.cpp)
+target_include_directories(TunerTest PRIVATE Source)
+
 juce_add_console_app(IrTest PRODUCT_NAME "IrTest")
 target_sources(IrTest PRIVATE Tests/IrTest.cpp)
 target_include_directories(IrTest PRIVATE Source)

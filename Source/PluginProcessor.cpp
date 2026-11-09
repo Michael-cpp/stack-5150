@@ -31,6 +31,9 @@ juce::AudioProcessorValueTreeState::ParameterLayout createLayout()
                                          juce::NormalisableRange<float> (-18.0f, 18.0f, 0.1f), 0.0f));
     layout.add (std::make_unique<juce::AudioParameterChoice> (Id { "cabmode", 1 }, "Cabinet",
                                                               juce::StringArray { "Off", "Built-in", "Impulse" }, 1));
+    layout.add (std::make_unique<juce::AudioParameterBool> (Id { "tuner", 1 }, "Tuner", false));
+    layout.add (std::make_unique<juce::AudioParameterBool> (Id { "tunermute", 1 }, "Tuner Mute", true));
+    layout.add (std::make_unique<Float> (Id { "a4", 1 }, "Tuner A4", juce::NormalisableRange<float> (430.0f, 450.0f, 1.0f), 440.0f));
     return layout;
 }
 } // namespace
@@ -85,8 +88,16 @@ void Stack5150Processor::prepareToPlay (double sampleRate, int samplesPerBlock)
     model.prepare (sampleRate * 4.0);
     model.setControls (readControls());
     convolution.prepare ({ sampleRate, (juce::uint32) samplesPerBlock, 1 });
+    tuner.prepare (sampleRate);
     ampGate.reset (sampleRate, 0.03);
-    ampGate.setCurrentAndTargetValue (*params.getRawParameterValue ("power") > 0.5f && *params.getRawParameterValue ("standby") > 0.5f ? 1.0f : 0.0f);
+    ampGate.setCurrentAndTargetValue (isOutputOpen() ? 1.0f : 0.0f);
+}
+
+// Power and Standby both have to be on for the amp to make any sound, and the tuner can mute it.
+bool Stack5150Processor::isOutputOpen() const
+{
+    const auto on = [this] (const char* id) { return params.getRawParameterValue (id)->load() > 0.5f; };
+    return on ("power") && on ("standby") && ! (on ("tuner") && on ("tunermute"));
 }
 
 juce::String Stack5150Processor::loadImpulse (const juce::File& file)
@@ -126,6 +137,9 @@ void Stack5150Processor::processBlock (juce::AudioBuffer<float>& buffer, juce::M
     if (inputs > 1)
         mono.applyGain (1.0f / (float) inputs);
 
+    if (params.getRawParameterValue ("tuner")->load() > 0.5f)
+        tuner.push (mono.getReadPointer (0), numSamples);
+
     const auto cal = juce::Decibels::decibelsToGain ((double) params.getRawParameterValue ("calibration")->load());
 
     juce::dsp::AudioBlock<float> block (mono);
@@ -148,8 +162,7 @@ void Stack5150Processor::processBlock (juce::AudioBuffer<float>& buffer, juce::M
         block.multiplyBy (4.0f); // JUCE normalises impulses to a low level; +12 dB restores it
     }
 
-    // Power and Standby both have to be on for the amp to make any sound.
-    ampGate.setTargetValue (*params.getRawParameterValue ("power") > 0.5f && *params.getRawParameterValue ("standby") > 0.5f ? 1.0f : 0.0f);
+    ampGate.setTargetValue (isOutputOpen() ? 1.0f : 0.0f);
     auto* out = mono.getWritePointer (0);
     for (int n = 0; n < numSamples; ++n)
         out[n] *= ampGate.getNextValue();
@@ -217,14 +230,16 @@ juce::String Stack5150Processor::loadPreset (const juce::File& file)
     if (xml == nullptr || ! xml->hasTagName (params.state.getType()))
         return "This is not a Stack 5150 preset";
 
-    // Loading a sound should never switch the amp off.
-    const auto power = params.getParameter ("power")->getValue();
-    const auto standby = params.getParameter ("standby")->getValue();
+    // Loading a sound should never switch the amp off or change the tuner.
+    const std::array<const char*, 5> keep { "power", "standby", "tuner", "tunermute", "a4" };
+    std::array<float, 5> kept {};
+    for (size_t i = 0; i < keep.size(); ++i)
+        kept[i] = params.getParameter (keep[i])->getValue();
 
     restoreState (*xml);
 
-    params.getParameter ("power")->setValueNotifyingHost (power);
-    params.getParameter ("standby")->setValueNotifyingHost (standby);
+    for (size_t i = 0; i < keep.size(); ++i)
+        params.getParameter (keep[i])->setValueNotifyingHost (kept[i]);
     return {};
 }
 
