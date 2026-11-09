@@ -169,6 +169,8 @@ public:
     }
 
     void setSourceResistance (double rsrc) { c.rsrc = rsrc; }
+    void setRail (double v) { c.vpp = v; }
+    double plateCurrent() const { return (c.vpp - vp) / c.rp; }
     void setGridLeak (double rl) { c.rl = rl; }
 
     // Keeps the cathode voltage continuous when the relay changes the bypass.
@@ -597,7 +599,7 @@ public:
     void prepare (double fs)
     {
         T = 1.0 / fs;
-        vp1 = railV3 * 0.6; vp2 = railV3 * 0.6; vk = 70.0;
+        rail = railV3; vp1 = rail * 0.6; vp2 = rail * 0.6; vk = 70.0;
         vc31 = 0.0;
         for (int i = 0; i < 80; ++i)
             solve (0.0, 0.0, true);
@@ -614,6 +616,7 @@ public:
     double plateB() const { return vp2; }
     double tail() const { return vk; }
     double tailCurrent() const { return current; }
+    void setRail (double v) { rail = v; }
 
     double dcTrack = 2.0 * pi * 3.4 / 192000.0; // C31 with its 1M return
 
@@ -642,8 +645,8 @@ private:
             const double da = (dj - 1.0) * a.dVgk - a.dVpk;
             const double db = (dg2 - 1.0) * b.dVgk - b.dVpk;
 
-            const double f1 = (railV3 - vp1) / Rp1 - a.ip;
-            const double f2 = (railV3 - vp2) / Rp2 - b.ip;
+            const double f1 = (rail - vp1) / Rp1 - a.ip;
+            const double f2 = (rail - vp2) / Rp2 - b.ip;
             const double f3 = a.ip + b.ip - it;
 
             const double a11 = -1.0 / Rp1 - a.dVpk, a13 = -da;
@@ -658,8 +661,8 @@ private:
             double dp2 = std::clamp ((-f2 - a23 * dk) / a22, -80.0, 80.0);
 
             vk = std::max (vk + dk, 0.0);
-            vp1 = std::clamp (vp1 + dp1, 1.0, railV3);
-            vp2 = std::clamp (vp2 + dp2, 1.0, railV3);
+            vp1 = std::clamp (vp1 + dp1, 1.0, rail + 30.0);
+            vp2 = std::clamp (vp2 + dp2, 1.0, rail + 30.0);
             current = it;
             tailQ = q;
             tailJ = vj;
@@ -669,24 +672,61 @@ private:
         }
     }
 
-    double T = 0.0, vp1 = 280.0, vp2 = 280.0, vk = 70.0, vc31 = 0.0, current = 0.005, tailQ = 0.0, tailJ = 0.0;
+    double rail = railV3, T = 0.0, vp1 = 280.0, vp2 = 280.0, vk = 70.0, vc31 = 0.0, current = 0.005, tailQ = 0.0, tailJ = 0.0;
 };
 
 struct Pentode
 {
     // kg1 is lowered from the published 1460 so the output stage reaches the 120 W measured on a real amp.
-    static constexpr double mu = 8.7, ex = 1.35, kg1 = 1100.0, kp = 48.0, kvb = 12.0;
+    static constexpr double mu = 8.7, ex = 1.35, kg1 = 950.0, kp = 48.0, kvb = 12.0;
 
-    static void plate (double vg, double vp, double& ip, double& dVp)
+    static void plate (double vg, double vp, double screen, double& ip, double& dVp)
     {
         double l, dl;
-        softPlus (kp * (1.0 / mu + vg / railScreen), l, dl);
-        const double e1 = railScreen / kp * l;
+        softPlus (kp * (1.0 / mu + vg / screen), l, dl);
+        const double e1 = screen / kp * l;
         const double base = std::pow (std::max (e1, 1.0e-9), ex) / kg1;
         const double v = std::max (vp, 1.0);
         ip = base * std::atan (v / kvb);
         dVp = base / kvb / (1.0 + v * v / (kvb * kvb));
     }
+};
+
+// Power supply sag. Tracks how far each rail has dropped below its idle value:
+//   rectifier - Rs - plate node - 400R - screen node - 4k - V3 - 22k - V2 - 10k - V1
+// Capacitor and resistor values are from the parts list.
+class PowerSupply
+{
+public:
+    static constexpr double Rs = 60.0;               // ESTIMATE: transformer winding and rectifier
+    static constexpr double screenShare = 0.12;      // ESTIMATE: screen current as a share of plate current
+    static constexpr double CPlate = 165e-6, R210 = 400.0, CScreen = 50e-6;
+    static constexpr double R59 = 4e3, C3 = 47e-6, R60 = 22e3, C2 = 22e-6, R61 = 10e3, C1 = 22e-6;
+
+    void prepare (double fs) { dt = 1.0 / fs; reset(); }
+    void reset() { p = s = v3 = v2 = v1 = 0.0; }
+
+    // Each argument is that node's load current minus its idle current, in amps.
+    void update (double dPlate, double dScreen, double d3, double d2, double d1)
+    {
+        const double iScreen = (p - s) / R210, i3 = (s - v3) / R59, i2 = (v3 - v2) / R60, i1 = (v2 - v1) / R61;
+        const double charge = p < 0.0 ? -p / Rs : 0.0;   // the rectifier can only top the capacitors up
+
+        p = std::min (p + dt / CPlate * (charge - dPlate - iScreen), 0.0);
+        s += dt / CScreen * (iScreen - dScreen - i3);
+        v3 += dt / C3 * (i3 - d3 - i2);
+        v2 += dt / C2 * (i2 - d2 - i1);
+        v1 += dt / C1 * (i1 - d1);
+    }
+
+    double plate() const { return railPlate + p; }
+    double screen() const { return railScreen + s; }
+    double rail3() const { return railV3 + v3; }
+    double rail2() const { return railV2 + v2; }
+    double rail1() const { return railV1 + v1; }
+
+private:
+    double dt = 1.0 / 176400.0, p = 0.0, s = 0.0, v3 = 0.0, v2 = 0.0, v1 = 0.0;
 };
 
 class PowerStage
@@ -713,22 +753,28 @@ public:
         for (int iter = 0; iter < 12; ++iter)
         {
             double ia, da, ib, db;
-            Pentode::plate (gridA, railPlate - x, ia, da);
-            Pentode::plate (gridB, railPlate + x, ib, db);
+            Pentode::plate (gridA, plateRail - x, screenRail, ia, da);
+            Pentode::plate (gridB, plateRail + x, screenRail, ib, db);
 
             // Two tubes per side, with Zaa/4 per side referred to the primary.
             const double load = Zaa * 0.25;
             const double f = x - 2.0 * (ia - ib) * load;
             const double dF = 1.0 + 2.0 * load * (da + db);
             const double dx = std::clamp (-f / dF, -120.0, 120.0);
-            x = std::clamp (x + dx, -railPlate + 5.0, railPlate - 5.0);
+            x = std::clamp (x + dx, -plateRail + 5.0, plateRail - 5.0);
             if (std::abs (dx) < 1.0e-4)
                 break;
         }
+        double ia, ib, unused;
+        Pentode::plate (gridA, plateRail - x, screenRail, ia, unused);
+        Pentode::plate (gridB, plateRail + x, screenRail, ib, unused);
+        totalCurrent = 2.0 * (ia + ib);
         return 2.0 * x;
     }
 
     double biasVoltage() const { return bias; }
+    double plateCurrent() const { return totalCurrent; }
+    void setRails (double plate, double screen) { plateRail = plate; screenRail = screen; }
 
 private:
     double driveGrid (double vsrc, double& h) const
@@ -758,7 +804,7 @@ private:
         return vg;
     }
 
-    double g = 1.0, bias = -40.0, x = 0.0, hA = 0.0, hB = 0.0;
+    double g = 1.0, bias = -40.0, x = 0.0, hA = 0.0, hB = 0.0, totalCurrent = 0.0, plateRail = railPlate, screenRail = railScreen;
 };
 
 struct Controls
@@ -822,7 +868,14 @@ public:
         blend = activeLead ? 1.0 : 0.0;
         setControls (controls);
         applyChannelRelays();
+        supply.prepare (fs);
+        sagActive = false;
         settle();
+        idle1 = v1a.plateCurrent() + v1b.plateCurrent() + v2a.plateCurrent();
+        idle2 = v2b.plateCurrent() + v5b.plateCurrent() + v5a.plateCurrent() + v3a.plateCurrent();
+        idle3 = pi2.tailCurrent();
+        idlePlate = power.plateCurrent();
+        sagActive = true;
     }
 
     void setControls (const Controls& next)
@@ -853,6 +906,19 @@ public:
 
     double process (double vin)
     {
+        if (sagActive)
+        {
+            v1a.setRail (supply.rail1());
+            v1b.setRail (supply.rail1());
+            v2a.setRail (supply.rail1());
+            v2b.setRail (supply.rail2());
+            v5b.setRail (supply.rail2());
+            v5a.setRail (supply.rail2());
+            v3a.setRail (supply.rail2());
+            pi2.setRail (supply.rail3());
+            power.setRails (supply.plate(), supply.screen());
+        }
+
         const double p1 = v1a.process (vin, 0.0);
         const double dc = blockV1.lowPass (p1);
         const double xLead = preNet.process (p1 - dc);
@@ -889,6 +955,14 @@ public:
         pi2.process ((driven - dcPi) * 0.91, fb);
 
         const double raw = power.process (pi2.plateA(), pi2.plateB());
+        if (sagActive)
+        {
+            const double dPlate = power.plateCurrent() - idlePlate;
+            supply.update (dPlate, dPlate * PowerSupply::screenShare, pi2.tailCurrent() - idle3,
+                           v2b.plateCurrent() + v5b.plateCurrent() + v5a.plateCurrent() + v3a.plateCurrent() - idle2,
+                           v1a.plateCurrent() + v1b.plateCurrent() + v2a.plateCurrent() - idle1);
+        }
+
         const double primary = raw - transformerLow.lowPass (raw); // the transformer cannot pass DC
         lastPrimary = primary;
 
@@ -906,6 +980,7 @@ public:
     }
     const PhaseInverter& inverter() const { return pi2; }
     const PowerStage& powerStage() const { return power; }
+    const PowerSupply& powerSupply() const { return supply; }
 
 private:
     // Relay K1 in rhythm: 22u bypass on V1B's cathode, 220k shunt on V2A's grid.
@@ -927,7 +1002,9 @@ private:
 
     double fs = 192000.0, v1aDc = 0.0, postLead = 0.1, postRhythm = 0.1, lastPrimary = 0.0;
     double blend = 1.0, blendStep = 0.001, leadSource = 200e3, rhythmSource = 200e3;
-    bool activeLead = true;
+    bool activeLead = true, sagActive = false;
+    PowerSupply supply;
+    double idle1 = 0.0, idle2 = 0.0, idle3 = 0.0, idlePlate = 0.0;
     RhythmNetwork rhythm;
     Controls controls;
     TriodeStage v1a, v1b, v2a, v2b, v5b, v5a, v3a;

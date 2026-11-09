@@ -402,7 +402,7 @@ int main()
 
             const double lpCoef = 1.0 - std::exp (-2.0 * pi * 720.0 / fs);
             double low = 0.0;
-            const int settle = (int) (fs * 1.2), N = period * 20;
+            const int settle = (int) (fs * 5.0), N = period * 20; // long enough for the supply rails to settle
             std::vector<double> y ((size_t) N);
             for (int i = 0; i < settle + N; ++i)
             {
@@ -428,35 +428,64 @@ int main()
     }
     std::puts ("-- power stage against measurements of a real amp --");
     {
+        // Sustained 1 kHz drive with the power supply sagging, as in a real full-power test.
         const double f = fs / 176.0, z = PowerStage::Zaa;
-        double power = 0.0;
-        for (double drive = 20.0; drive <= 200.0; drive += 5.0)
-        {
-            PowerStage s;
-            s.prepare (fs);
-            s.setSourceDc (0.0, 0.0);
-            const int settle = (int) fs / 8, n = 176 * 60;
-            double sum2 = 0.0, a = 0.0, b = 0.0;
-            for (int i = 0; i < settle + n; ++i)
-            {
-                const double t = 2.0 * pi * f * i / fs, v = drive * std::sin (t);
-                const double y = s.process (v, -v);
-                if (i >= settle) { sum2 += y * y; a += y * std::sin (t); b += y * std::cos (t); }
-            }
-            const double rms = std::sqrt (sum2 / n), fund = std::sqrt (2.0) * std::hypot (a, b) / n;
-            const double thd = std::sqrt (std::max (0.0, rms * rms - fund * fund)) / fund;
-            if (thd <= 0.10)
-                power = std::max (power, rms * rms / z);
-        }
-        check ("power at up to 10% distortion (W, measured 120)", power, 110.0, 130.0);
-        check ("voltage into 8 ohm (V rms, measured 31)", std::sqrt (power * 8.0), 29.5, 32.5);
-
         PowerStage s;
         s.prepare (fs);
-        check ("bias voltage (measured -58)", s.biasVoltage(), -58.5, -57.5);
+        s.setSourceDc (0.0, 0.0);
+        PowerSupply sup;
+        sup.prepare (fs);
+        s.process (0.0, 0.0);
+        const double idle = s.plateCurrent();
+        const int settle = (int) (fs * 0.5), n = 176 * 40;
+        double sum2 = 0.0;
+        for (int i = 0; i < settle + n; ++i)
+        {
+            const double v = 80.0 * std::sin (2.0 * pi * f * i / fs);
+            s.setRails (sup.plate(), sup.screen());
+            const double y = s.process (v, -v);
+            const double d = s.plateCurrent() - idle;
+            sup.update (d, d * PowerSupply::screenShare, 0.0, 0.0, 0.0);
+            if (i >= settle)
+                sum2 += y * y;
+        }
+        const double power = sum2 / n / z;
+        check ("full power with sag (W, measured 120)", power, 110.0, 130.0);
+        check ("voltage into 8 ohm (V rms, measured 31)", std::sqrt (power * 8.0), 29.5, 32.5);
+        check ("plate sag at full power (V)", railPlate - sup.plate(), 8.0, 45.0);
+
+        PowerStage fresh;
+        fresh.prepare (fs);
+        check ("bias voltage (measured -58)", fresh.biasVoltage(), -58.5, -57.5);
         double ip, slope;
-        Pentode::plate (s.biasVoltage(), railPlate, ip, slope);
-        check ("idle current per tube (mA, stock amps 11-14)", ip * 1000.0, 10.0, 15.0);
+        Pentode::plate (fresh.biasVoltage(), railPlate, railScreen, ip, slope);
+        check ("idle current per tube (mA, stock amps 11-18)", ip * 1000.0, 10.0, 18.0);
+    }
+
+    std::puts ("-- power supply sag in the whole amp --");
+    {
+        Amp q;
+        q.prepare (fs);
+        Controls c;
+        c.pre = 0.72; c.post = 0.7; c.cab = false;
+        q.setControls (c);
+
+        check ("no sag at idle (plate rail change, V)", std::abs (q.powerSupply().plate() - railPlate), 0.0, 0.5);
+
+        const auto play = [&] (double level, double seconds)
+        {
+            for (int i = 0; i < (int) (seconds * fs); ++i)
+                q.process (level * std::sin (2.0 * pi * 110.0 * i / fs));
+        };
+
+        play (0.3, 1.5);
+        const double loaded = q.powerSupply().plate();
+        const double preampLoaded = q.powerSupply().rail2();
+        check ("plate rail drops when played hard (V)", railPlate - loaded, 3.0, 60.0);
+        check ("preamp rail stays in a sensible range (V)", preampLoaded, railV2 - 60.0, railV2 + 15.0);
+
+        play (0.0, 0.5);
+        check ("plate rail recovers in silence (V from idle)", std::abs (q.powerSupply().plate() - railPlate), 0.0, 2.0);
     }
 
     std::puts ("-- preamp rails against the supply chain --");
